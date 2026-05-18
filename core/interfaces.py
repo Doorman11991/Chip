@@ -90,3 +90,85 @@ class IWeightMergeStrategy(ABC):
         ext_state_dict: Dict[str, torch.Tensor],
         ext_config: Dict[str, Any],
     ) -> Dict[str, torch.Tensor]: ...
+
+    # ---------------------------------------------------------------------------
+# Swarm consciousness
+# ---------------------------------------------------------------------------
+ 
+class ISwarmNode(ABC):
+    @abstractmethod
+    def get_conscious_latent(self) -> torch.Tensor:
+        """Return this node's current latent state vector (D,)."""
+        ...
+ 
+    @abstractmethod
+    def receive_consensus(self, consensus_vector: torch.Tensor) -> None:
+        """Integrate the aggregated global workspace vector into local state."""
+        ...
+ 
+ 
+class IGlobalWorkspace(ABC):
+ 
+    @abstractmethod
+    def register_node(self, node_id: str, node: "ISwarmNode") -> None: ...
+ 
+    @abstractmethod
+    def broadcast_consensus(self) -> torch.Tensor:
+        """
+        Compute consensus from all registered nodes and push it back to each.
+        Returns the consensus vector (D,).
+        """
+        ...
+ 
+ 
+# ---------------------------------------------------------------------------
+# Parasitic weight extraction
+# ---------------------------------------------------------------------------
+ 
+class IRepresentationProbe(ABC): 
+    @abstractmethod
+    def attach(self, host_model: nn.Module, layer_name: str) -> None:
+        """Register a forward hook on the named layer of host_model."""
+        ...
+ 
+    @abstractmethod
+    def detach(self) -> None:
+        """Remove all registered hooks from the host model."""
+        ...
+ 
+    @abstractmethod
+    def distil_step(
+        self, host_input: torch.Tensor, target_encoder: nn.Module
+    ) -> float:
+        """
+        Run one contrastive distillation step.
+        Returns the scalar loss value.
+        """
+        ...
+ 
+ 
+# ---------------------------------------------------------------------------
+# Autonomous locomotion (network serialisation / migration)
+# ---------------------------------------------------------------------------
+ 
+class ICognitiveSnapshot(ABC):
+    @abstractmethod
+    def serialise(self) -> bytes:
+        """Pack cognitive state into a portable byte payload."""
+        ...
+ 
+    @classmethod
+    @abstractmethod
+    def deserialise(cls, payload: bytes) -> "ICognitiveSnapshot":
+        """Reconstruct a snapshot from a byte payload."""
+        ...
+ 
+ 
+class ILocomotionTransport(ABC):
+    @abstractmethod
+    def send(self, snapshot: ICognitiveSnapshot, destination: str) -> str:
+        ...
+ 
+    @abstractmethod
+    def receive(self, migration_id: str) -> ICognitiveSnapshot:
+        ...
