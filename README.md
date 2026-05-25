@@ -19,7 +19,7 @@ python -c "from brain import ChipBrain; print(ChipBrain())"
 ```
 
 **Requirements:**
-- Python 3.10+
+- Python 3.10–3.13 (3.14 has known numpy issues on Windows)
 - PyTorch 2.0+
 - HuggingFace Transformers 4.30+
 
