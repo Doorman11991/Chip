@@ -5,3 +5,4 @@ __pycache__/
 .shiva_state/
 *.gguf
 .DS_Store
+.env

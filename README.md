@@ -14,6 +14,9 @@ cd Shiva
 # Install dependencies (just two)
 pip install torch transformers
 
+# (Optional) Copy the env template
+cp .env.example .env
+
 # Verify everything works
 python -c "from brain import ChipBrain; print(ChipBrain())"
 ```
