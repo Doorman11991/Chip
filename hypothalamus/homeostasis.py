@@ -42,7 +42,7 @@ class HomeostaticRegulator(nn.Module):
         super().__init__()
         assert len(initial) == self.N_DIMS and len(target) == self.N_DIMS
         self._state = nn.Parameter(torch.tensor(list(initial), dtype=torch.float32), requires_grad=False)
-        self._target = torch.tensor(list(target), dtype=torch.float32)
+        self.register_buffer("_target", torch.tensor(list(target), dtype=torch.float32))
 
     @property
     def state(self) -> torch.Tensor:
@@ -50,7 +50,7 @@ class HomeostaticRegulator(nn.Module):
 
     @property
     def target(self) -> torch.Tensor:
-        return self._target.to(self._state.device)
+        return self._target
 
     def update(self, deltas: Dict[str, float]) -> None:
         """

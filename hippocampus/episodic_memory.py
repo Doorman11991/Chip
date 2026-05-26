@@ -144,7 +144,7 @@ class EpisodicMemory(IEpisodicMemory):
             z = z.unsqueeze(0)
 
         T = z.shape[0]
-        valences = torch.full((T, 1), float(valence))
+        valences = torch.full((T, 1), float(valence), device=z.device)
         self.store_episode(
             state_sequence=z,
             valence_sequence=valences,

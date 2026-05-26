@@ -1,4 +1,4 @@
-﻿"""
+"""
 thalamus/sensory_encoder.py — Unified multi-modal input encoding.
 
 The thalamus receives raw sensory signals from all modalities and
@@ -140,11 +140,11 @@ class SensoryEncoder(nn.Module):
 
         z = self.encoders[modality](x)  # (B, D)
 
-        # Add modality type embedding
+        # Add modality type embedding.
+        # DirectML does not support integer index tensors for nn.Embedding,
+        # so we index the weight matrix directly with a Python int instead.
         mod_idx = self._modality_to_idx.get(modality, 0)
-        mod_embed = self.modality_embed(
-            torch.tensor([mod_idx], device=z.device)
-        )  # (1, D)
+        mod_embed = self.modality_embed.weight[mod_idx].unsqueeze(0).to(z.device)  # (1, D)
         z = z + mod_embed
 
         return z.unsqueeze(1)  # (B, 1, D)

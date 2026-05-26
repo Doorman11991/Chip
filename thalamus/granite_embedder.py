@@ -259,7 +259,6 @@ class GraniteEmbedder(nn.Module):
     # Internal: synchronous forward pass
     # ------------------------------------------------------------------
 
-    @torch.inference_mode()
     def _encode_sync(
         self,
         text: Union[str, Sequence[str]],
@@ -271,25 +270,30 @@ class GraniteEmbedder(nn.Module):
         if not items:
             return torch.empty(0, self.output_dim, device=self.device_)
 
-        chunks: List[torch.Tensor] = []
-        for start in range(0, len(items), batch_size):
-            batch = items[start : start + batch_size]
-            batch_enc = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=self.max_seq_len,
-                return_tensors="pt",
-            ).to(self.device_)
+        # DirectML does not support torch.inference_mode() — use no_grad instead.
+        # On CUDA/CPU inference_mode is faster, so we pick based on device type.
+        _no_grad_ctx = torch.no_grad if self.device_.type == "privateuseone" else torch.inference_mode
 
-            outputs = self.encoder(**batch_enc)
-            hidden = outputs.last_hidden_state
-            pooled = self._mean_pool(hidden, batch_enc["attention_mask"])
-            pooled = F.normalize(pooled, p=2, dim=-1)
-            pooled = pooled.to(self.projection.weight.dtype)
-            projected = self.projection(pooled)
-            projected = F.normalize(projected, p=2, dim=-1)
-            chunks.append(projected)
+        chunks: List[torch.Tensor] = []
+        with _no_grad_ctx():
+            for start in range(0, len(items), batch_size):
+                batch = items[start : start + batch_size]
+                batch_enc = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_seq_len,
+                    return_tensors="pt",
+                ).to(self.device_)
+
+                outputs = self.encoder(**batch_enc)
+                hidden = outputs.last_hidden_state
+                pooled = self._mean_pool(hidden, batch_enc["attention_mask"])
+                pooled = F.normalize(pooled, p=2, dim=-1)
+                pooled = pooled.to(self.projection.weight.dtype)
+                projected = self.projection(pooled)
+                projected = F.normalize(projected, p=2, dim=-1)
+                chunks.append(projected)
 
         z = torch.cat(chunks, dim=0)
         return z[0] if single else z

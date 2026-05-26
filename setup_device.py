@@ -163,13 +163,12 @@ def _torch_install_cmd(backend: str, os_label: str) -> Optional[list[str]]:
             return None  # already installed
         except ImportError:
             pass
-        # torch-directml only supports Python 3.10-3.12 as of 2026-05
+        # torch-directml only supports Python 3.10-3.12 as of 2026-05.
+        # If we're on 3.13+, we need to use a 3.12 venv.
         major, minor = sys.version_info[:2]
         if not (major == 3 and 10 <= minor <= 12):
-            print(f"  [setup_device] torch-directml requires Python 3.10-3.12 "
-                  f"(you have {major}.{minor}). Skipping DirectML install.")
-            print(f"  Tip: create a Python 3.12 venv and re-run setup_device.py")
-            return None  # signal no install, caller will fall back to cpu
+            # Signal to the caller that a venv is needed instead.
+            return "NEEDS_VENV"
         return [
             sys.executable, "-m", "pip", "install", "--upgrade",
             "torch-directml",
@@ -244,7 +243,18 @@ def setup(force: bool = False) -> Dict:
 
     # Install the right torch backend
     cmd = _torch_install_cmd(gpu["backend"], gpu["os"])
-    if cmd:
+    if cmd == "NEEDS_VENV":
+        # DirectML on Python 3.13+ — create a 3.12 venv and install there.
+        venv_ok = _setup_directml_venv(gpu)
+        if venv_ok:
+            gpu["backend"] = "directml"
+            gpu["verified"] = True
+            gpu["venv"] = ".venv-dml"
+        else:
+            print("[setup_device] Venv setup failed. Falling back to CPU.")
+            gpu["backend"] = "cpu"
+            gpu["verified"] = True
+    elif cmd:
         print(f"\n[setup_device] Installing {gpu['backend']} backend...")
         print(f"  {' '.join(cmd)}")
         result = subprocess.run(cmd)
@@ -252,22 +262,20 @@ def setup(force: bool = False) -> Dict:
             print(f"[setup_device] WARNING: install returned exit code {result.returncode}")
             print("  Falling back to CPU.")
             gpu["backend"] = "cpu"
+        # Verify after install
+        gpu["verified"] = _verify_backend(gpu["backend"])
+        if not gpu["verified"]:
+            print(f"[setup_device] {gpu['backend']} not functional. Falling back to CPU.")
+            gpu["backend"] = "cpu"
+            gpu["verified"] = True
     else:
         # cmd is None: either already installed, or install was skipped
-        # (e.g. Python version incompatibility). Check if the backend works.
         if gpu["backend"] not in ("cpu", "mps"):
             if not _verify_backend(gpu["backend"]):
                 print(f"[setup_device] {gpu['backend']} not available. Falling back to CPU.")
                 gpu["backend"] = "cpu"
-        print("[setup_device] Backend ready (no install needed).")
-
-    # Verify the backend actually works after install
-    gpu["verified"] = _verify_backend(gpu["backend"])
-    if not gpu["verified"]:
-        print(f"[setup_device] WARNING: {gpu['backend']} not functional after install. "
-              "Falling back to CPU.")
-        gpu["backend"] = "cpu"
         gpu["verified"] = True
+        print("[setup_device] Backend ready (no install needed).")
 
     # Write config
     with open(config_path, "w") as f:
@@ -275,7 +283,141 @@ def setup(force: bool = False) -> Dict:
     print(f"\n[setup_device] Written to {config_path}")
     print(f"[setup_device] Chip will use: {gpu['backend']}")
 
+    # Write launcher scripts if a venv was created for DirectML
+    if gpu.get("venv"):
+        _write_launchers(gpu["venv"], gpu["os"])
+
     return gpu
+
+
+def _setup_directml_venv(gpu: Dict) -> bool:
+    """
+    Create a Python 3.12 venv at .venv-dml and install torch-directml into it.
+    Returns True on success.
+    """
+    venv_path = Path(".venv-dml")
+    py312 = _find_python312()
+    if py312 is None:
+        print("  [setup_device] Python 3.12 not found on PATH.")
+        print("  Install Python 3.12 from python.org and re-run setup_device.py.")
+        return False
+
+    print(f"\n[setup_device] Creating Python 3.12 venv at {venv_path}...")
+    print(f"  Using: {py312}")
+
+    # Create venv
+    r = subprocess.run([py312, "-m", "venv", str(venv_path), "--prompt", "chip-dml"])
+    if r.returncode != 0:
+        print("  Venv creation failed.")
+        return False
+
+    # Determine venv python/pip paths
+    if sys.platform == "win32":
+        venv_python = str(venv_path / "Scripts" / "python.exe")
+        venv_pip = str(venv_path / "Scripts" / "pip.exe")
+    else:
+        venv_python = str(venv_path / "bin" / "python")
+        venv_pip = str(venv_path / "bin" / "pip")
+
+    # Upgrade pip
+    subprocess.run([venv_python, "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
+
+    # Install torch-directml (pins torch==2.4.1)
+    print("[setup_device] Installing torch-directml...")
+    r = subprocess.run([venv_pip, "install", "torch-directml"])
+    if r.returncode != 0:
+        print("  torch-directml install failed.")
+        return False
+
+    # Install transformers pinned to <5.0 (compatible with torch 2.4.1)
+    print("[setup_device] Installing transformers (pinned <5.0 for torch 2.4.1 compat)...")
+    r = subprocess.run([venv_pip, "install", "transformers>=4.30,<5.0"])
+    if r.returncode != 0:
+        print("  transformers install failed.")
+        return False
+
+    # Install remaining Chip dependencies
+    print("[setup_device] Installing remaining dependencies...")
+    r = subprocess.run([venv_pip, "install", "flask", "edge-tts", "--quiet"])
+    if r.returncode != 0:
+        print("  WARNING: some optional deps failed to install.")
+
+    # Verify DirectML works in the venv
+    check = subprocess.run(
+        [venv_python, "-c",
+         "import torch, torch_directml; d=torch_directml.device(); "
+         "t=torch.zeros(4,device=d)+1; print('OK')"],
+        capture_output=True, text=True
+    )
+    if "OK" not in check.stdout:
+        print(f"  DirectML verification failed: {check.stderr[:200]}")
+        return False
+
+    print(f"[setup_device] DirectML venv ready at {venv_path}")
+    return True
+
+
+def _find_python312() -> Optional[str]:
+    """Find a Python 3.12 executable on the system."""
+    candidates = ["py", "python3.12", "python3", "python"]
+    for cmd in candidates:
+        try:
+            # Try py launcher first (Windows)
+            if cmd == "py":
+                r = subprocess.run(["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            else:
+                r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and "3.12" in r.stdout + r.stderr:
+                    return cmd
+        except Exception:
+            continue
+    return None
+
+
+def _write_launchers(venv: str, os_label: str) -> None:
+    """Write run.bat / run.sh launcher scripts that use the DirectML venv."""
+    venv_path = Path(venv)
+
+    if os_label == "windows":
+        bat = Path("run_dml.bat")
+        bat.write_text(
+            "@echo off\n"
+            "REM Chip launcher — uses the DirectML venv (Python 3.12 + torch-directml)\n"
+            f'"{venv_path}\\Scripts\\python.exe" %*\n',
+            encoding="utf-8",
+        )
+        demo_bat = Path("demo_dml.bat")
+        demo_bat.write_text(
+            "@echo off\n"
+            "REM Start the Chip demo server on DirectML\n"
+            f'"{venv_path}\\Scripts\\python.exe" demo\\app.py\n',
+            encoding="utf-8",
+        )
+        print(f"[setup_device] Launchers written:")
+        print(f"  run_dml.bat       — run any python script with DirectML")
+        print(f"  demo_dml.bat      — start the demo server")
+        print(f"\n  Usage: demo_dml.bat")
+        print(f"         run_dml.bat run.py")
+    else:
+        sh = Path("run_dml.sh")
+        sh.write_text(
+            "#!/bin/bash\n"
+            "# Chip launcher — uses the DirectML venv\n"
+            f'"{venv_path}/bin/python" "$@"\n',
+            encoding="utf-8",
+        )
+        sh.chmod(0o755)
+        demo_sh = Path("demo_dml.sh")
+        demo_sh.write_text(
+            "#!/bin/bash\n"
+            f'"{venv_path}/bin/python" demo/app.py\n',
+            encoding="utf-8",
+        )
+        demo_sh.chmod(0o755)
+        print(f"[setup_device] Launchers written: run_dml.sh, demo_dml.sh")
 
 
 def _verify_backend(backend: str) -> bool:

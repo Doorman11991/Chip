@@ -49,7 +49,7 @@ class MoodState:
         self._reason = reason
 
 
-class HomeostasisState:
+class HomeostasisState(nn.Module):
     """
     4-D homeostatic drive vector: [arousal, energy, safety, engagement].
     Clamped to [0,1]. strain() = L2 distance from target setpoint.
@@ -60,8 +60,9 @@ class HomeostasisState:
         initial: Tuple[float, float, float, float] = (0.5, 0.8, 1.0, 0.5),
         target: Tuple[float, float, float, float] = (0.8, 1.0, 0.7, 0.6),
     ) -> None:
+        super().__init__()
         self._state = nn.Parameter(torch.tensor(list(initial)), requires_grad=False)
-        self._target = torch.tensor(list(target))
+        self.register_buffer("_target", torch.tensor(list(target)))
 
     @property
     def vector(self) -> torch.Tensor:
@@ -83,8 +84,7 @@ class HomeostasisState:
         self._state.clamp_(0, 1)
 
     def strain(self) -> torch.Tensor:
-        target = self._target.to(self._state.device)
-        return torch.norm(self._state - target)
+        return torch.norm(self._state - self._target)
 
 
 class EmotionalCore(nn.Module):
@@ -192,7 +192,7 @@ class EmotionalCore(nn.Module):
         return self._homeostasis.strain()
 
     def get_valence(self, latent_state: torch.Tensor) -> torch.Tensor:
-        s = self._homeostasis.vector
+        s = self._homeostasis.vector.to(latent_state.device)
         if latent_state.dim() > 1:
             s = s.unsqueeze(0).expand(latent_state.size(0), -1)
         combined = torch.cat([latent_state, s], dim=-1)

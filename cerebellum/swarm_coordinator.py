@@ -1,4 +1,4 @@
-﻿"""
+"""
 cerebellum/swarm_coordinator.py — Multi-agent motor coordination.
 
 The cerebellum coordinates smooth, precise movement across multiple
@@ -140,11 +140,13 @@ class SwarmCoordinator(nn.Module):
     def step(self) -> Tuple[torch.Tensor, torch.Tensor]:
         consensus = self.workspace.broadcast_consensus()
         div_loss = self.workspace.last_diversity_loss
-        return consensus, div_loss if div_loss is not None else torch.tensor(0.0)
+        fallback = torch.tensor(0.0, device=consensus.device)
+        return consensus, div_loss if div_loss is not None else fallback
 
     def get_diversity_loss(self) -> torch.Tensor:
         div = self.workspace.last_diversity_loss
-        return div if div is not None else torch.tensor(0.0)
+        device = next(self.parameters()).device
+        return div if div is not None else torch.tensor(0.0, device=device)
 
     def get_node_latent(self, node_id: str) -> torch.Tensor:
         return self._node_modules[node_id].get_conscious_latent()  # type: ignore[attr-defined]

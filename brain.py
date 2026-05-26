@@ -305,28 +305,28 @@ class ChipBrain:
             narrative_window=self.cfg["narrative_window"],
         ).to(self.device)
         self.dream = DreamCycle(noise_scale=0.05, counterfactual_k=3)
-        self.temporal = TemporalAbstractor(latent_dim=D)
-        self.cog_map = CognitiveMap(latent_dim=D, max_cells=512)
+        self.temporal = TemporalAbstractor(latent_dim=D).to(self.device)
+        self.cog_map = CognitiveMap(latent_dim=D, max_cells=512).to(self.device)
         self.recall = EpisodicRecall(self.memory, mode="endpoint", top_k=3, min_similarity=0.3)
         self.boundary = BoundaryDetector(sensitivity=2.0, min_episode_len=8, warmup=10)
 
         # ---- Hypothalamus ----------------------------------------------
-        self.homeostasis = HomeostaticRegulator()
-        self.curiosity = CuriosityDrive(latent_dim=D)
+        self.homeostasis = HomeostaticRegulator().to(self.device)
+        self.curiosity = CuriosityDrive(latent_dim=D).to(self.device)
         self.energy = EnergyManager()
         self.drive_arb = DriveArbitrator()
-        self.entropy_reg = EntropyTemperatureRegulator(action_dim=A)
+        self.entropy_reg = EntropyTemperatureRegulator(action_dim=A).to(self.device)
 
         # ---- Cerebrum --------------------------------------------------
         self.working_mem = WorkingMemory(latent_dim=D, capacity=7)
         self.world_model = LatentDynamicsModel(latent_dim=D, action_dim=A).to(self.device)
         self.wm_trainer = WorldModelTrainer(self.world_model)
-        self.meta = MetaCognitionMonitor(d_model=D, action_dim=A)
+        self.meta = MetaCognitionMonitor(d_model=D, action_dim=A).to(self.device)
         self.reasoning = ReasoningChain(latent_dim=D, n_steps=3).to(self.device)
         self.plan_eval = PlanEvaluator(latent_dim=D).to(self.device)
         self.concepts = ConceptGrounder(d_model=D)
-        self.narrative = NarrativeSelf(latent_dim=D)
-        self.goals = GoalGenerator(latent_dim=D)
+        self.narrative = NarrativeSelf(latent_dim=D).to(self.device)
+        self.goals = GoalGenerator(latent_dim=D).to(self.device)
         self.goal_stack = GoalStack(max_depth=5, default_max_ticks=100)
         self.personality = PersonalityTraits(latent_dim=D).to(self.device)
         self.causal = CausalEngine(latent_dim=D, action_dim=A).to(self.device)
@@ -566,7 +566,7 @@ class ChipBrain:
         # 4. HYPOTHALAMUS — drive signals
         # ----------------------------------------------------------------
         # Curiosity from world model prediction error (if we have a prior state)
-        curiosity_reward = torch.zeros(1, 1)
+        curiosity_reward = torch.zeros(1, 1, device=self.device)
         if self._last_z is not None and self._last_action is not None:
             with torch.no_grad():
                 z_pred = self.world_model(self._last_z, self._last_action)

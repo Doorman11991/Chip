@@ -93,12 +93,13 @@ class TemporalAbstractor(nn.Module):
 
         Levels without a summary yet use zero vectors.
         """
+        device = next(self.projection.parameters()).device
         summaries = []
         for level in self._levels:
             if level.is_ready:
-                summaries.append(level.summary)
+                summaries.append(level.summary.to(device))
             else:
-                summaries.append(torch.zeros(self.latent_dim))
+                summaries.append(torch.zeros(self.latent_dim, device=device))
 
         combined = torch.cat(summaries, dim=-1).unsqueeze(0)  # (1, D*n_levels)
         return self.projection(combined).squeeze(0)           # (D,)

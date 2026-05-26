@@ -153,19 +153,14 @@ class ActiveDreamer:
 
         for dp in decision_points:
             z_at_dp = episode_states[dp].unsqueeze(0)  # (1, D)
+            device = episode_states.device
 
-            # The "original action" is approximated by the state delta
-            # (since we don't store actions in the episode). This is a
-            # proxy — the true action is lost, but the direction of change
-            # captures its effect.
             if dp < T - 1:
                 original_direction = episode_states[dp + 1] - episode_states[dp]
-                # Project state delta to action dim (take first A dims as proxy)
                 original_action = original_direction[:self.action_dim]
             else:
-                original_action = torch.zeros(self.action_dim)
+                original_action = torch.zeros(self.action_dim, device=device)
 
-            # Estimate the value of the actual trajectory from this point
             actual_future = episode_states[dp:dp + self.horizon + 1]
             if actual_future.shape[0] > 1:
                 actual_value = float(
@@ -176,15 +171,12 @@ class ActiveDreamer:
             else:
                 actual_value = 0.0
 
-            # Sample K alternative actions and roll out each
             for k in range(self.n_alternatives):
-                alt_action = torch.randn(1, self.action_dim) * 0.5
-                # Roll out through world model
+                alt_action = torch.randn(1, self.action_dim, device=device) * 0.5
                 trajectory = [z_at_dp.squeeze(0)]
                 z = z_at_dp
                 for h in range(self.horizon):
-                    # First step uses alt_action, subsequent steps use zero (passive)
-                    a = alt_action if h == 0 else torch.zeros(1, self.action_dim)
+                    a = alt_action if h == 0 else torch.zeros(1, self.action_dim, device=device)
                     z = self.world_model(z, a)
                     trajectory.append(z.squeeze(0))
 

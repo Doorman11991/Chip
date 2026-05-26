@@ -117,10 +117,11 @@ class EntropyTemperatureRegulator(nn.Module):
         self.optimizer.step()
 
         # Hard clamp after update
+        import math as _math
         with torch.no_grad():
             self.log_alpha.clamp_(
-                min=torch.log(torch.tensor(self.alpha_min)),
-                max=torch.log(torch.tensor(self.alpha_max)),
+                min=_math.log(self.alpha_min),
+                max=_math.log(self.alpha_max),
             )
 
         return alpha_loss.item()
