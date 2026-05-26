@@ -1,4 +1,4 @@
-﻿"""
+"""
 brain.py — The Chip consciousness loop.
 
 This is the top-level assembly and runtime for the entire brain. It:
@@ -68,6 +68,8 @@ from brainstem.gradient_clipper import GradientClipper
 from brainstem.scheduler import WarmupCosineScheduler, TrainingPhaseManager
 from brainstem.online_trainer import PrioritizedReplayBuffer, ChipTrainer
 from brainstem.cryostasis import Cryostasis
+from brainstem.circadian import CircadianCycle
+from brainstem.forgetting_prevention import EWC
 
 # ---------------------------------------------------------------------------
 # Thalamus
@@ -86,12 +88,14 @@ from amygdala.fear_assessment import FearAssessor
 from amygdala.arousal_modulator import ArousalModulator
 from amygdala.emotional_memory import EmotionalMemoryTagger
 from amygdala.habituation import HabituationFilter
+from amygdala.affective_forecast import AffectiveForecaster, AffectiveForecasterTrainer
 
 # ---------------------------------------------------------------------------
 # Hippocampus
 # ---------------------------------------------------------------------------
 from hippocampus.episodic_memory import EpisodicMemory
 from hippocampus.dream_cycle import DreamCycle
+from hippocampus.active_dreaming import ActiveDreamer
 from hippocampus.temporal_abstraction import TemporalAbstractor
 from hippocampus.spatial_map import CognitiveMap
 from hippocampus.memory_consolidation import MemoryConsolidator
@@ -126,6 +130,7 @@ from cerebrum.causal_engine import CausalEngine
 from cerebrum.attention_query import AttentionQueryBuilder
 from cerebrum.inner_speech import InnerSpeech
 from cerebrum.self_consistency import ConsistencyChecker
+from cerebrum.planner import TreeSearchPlanner
 
 # ---------------------------------------------------------------------------
 # Cerebellum
@@ -133,6 +138,7 @@ from cerebrum.self_consistency import ConsistencyChecker
 from cerebellum.swarm_coordinator import SwarmCoordinator
 from cerebellum.action_smoother import ActionSmoother
 from cerebellum.skill_library import SkillLibrary
+from cerebellum.emotional_contagion import EmotionalContagion
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +172,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "mood_grounding_every": 100,
     "world_model_update_every": 5,
     "consolidation_every": 200,
+    "ewc_consolidate_every": 1000,
+    "affective_train_every": 20,
+
+    # Circadian
+    "circadian_sleep_threshold": 0.2,
+    "circadian_wake_threshold": 0.6,
+    "circadian_min_wake_ticks": 50,
+    "circadian_max_sleep_ticks": 20,
 
     # Persistence
     "state_dir": ".chip_state",
@@ -334,6 +348,7 @@ class ChipBrain:
         self.swarm = SwarmCoordinator(latent_dim=D, n_nodes=3)
         self.smoother = ActionSmoother(action_dim=A, method="ema", alpha=0.7)
         self.skills = SkillLibrary(latent_dim=D)
+        self.emo_contagion = EmotionalContagion()
 
         # ---- Brainstem trainer -----------------------------------------
         self.buffer = PrioritizedReplayBuffer(capacity=self.cfg["replay_capacity"])
@@ -351,6 +366,48 @@ class ChipBrain:
             grad_clip=self.cfg["grad_clip"],
             device=self.device_str,
         )
+
+        # ---- Brainstem: EWC + Circadian + LR scheduler -----------------
+        self.ewc = EWC(
+            model=self.policy,
+            consolidation_strength=100.0,
+            fisher_samples=200,
+        )
+        self.circadian = CircadianCycle(
+            sleep_threshold=self.cfg["circadian_sleep_threshold"],
+            wake_threshold=self.cfg["circadian_wake_threshold"],
+            min_wake_ticks=self.cfg["circadian_min_wake_ticks"],
+            max_sleep_ticks=self.cfg["circadian_max_sleep_ticks"],
+        )
+        self.lr_scheduler = WarmupCosineScheduler(
+            optimizer=self.trainer.actor_optimizer,
+            warmup_steps=500,
+            total_steps=50_000,
+            lr_max=self.cfg["lr_actor"],
+            lr_min=1e-5,
+        )
+
+        # ---- Active dreamer (replaces the no-op DreamCycle) ------------
+        self.active_dreamer = ActiveDreamer(
+            world_model=self.world_model,
+            plan_evaluator=self.plan_eval,
+            action_dim=A,
+            horizon=5,
+            n_alternatives=4,
+        )
+
+        # ---- Tree-search planner ---------------------------------------
+        self.planner = TreeSearchPlanner(
+            world_model=self.world_model,
+            plan_evaluator=self.plan_eval,
+            action_dim=A,
+            n_candidates=8,
+            horizon=5,
+        )
+
+        # ---- Affective forecaster + trainer ----------------------------
+        self.affect_forecaster = AffectiveForecaster(latent_dim=D).to(self.device)
+        self.affect_trainer = AffectiveForecasterTrainer(self.affect_forecaster)
 
         self._booted = True
 
@@ -433,8 +490,6 @@ class ChipBrain:
         valence = self.emotions.get_valence(z_pooled)               # (B, 1)
         arousal_val = float(self.emotions._homeostasis.vector[0].item())
         # Habituation: dampen arousal for repeated/familiar observations.
-        # Uses the backbone-processed latent (z_pooled) which has more
-        # variance across inputs than raw granite embeddings.
         arousal_val = self.habituation.modulate_arousal(arousal_val, z_pooled.squeeze(0))
         arousal_gain = self.arousal_mod(torch.tensor([[arousal_val]]).to(self.device))
         mood_name, _ = self.emotions.current_mood()
@@ -527,7 +582,19 @@ class ChipBrain:
             # Partial WM decay on boundary (context partially carries over)
             self.working_mem.decay_step()
 
-        # Update homeostasis from novelty and curiosity
+        # Emotional memory tagging: compute significance for this observation
+        # so the hippocampus can weight replay sampling appropriately.
+        emo_significance = self.emo_tagger.compute_significance(
+            valence=valence.detach().cpu(),
+            arousal=torch.tensor([[arousal_val]]),
+            surprise=torch.tensor([[pred_err_scalar]]),
+        )
+        self._last_emo_significance = float(emo_significance.mean().item())
+
+        # Circadian: record reward for plateau detection, advance tick.
+        self.circadian.record_reward(pred_err_scalar)
+        self.circadian.tick()
+
         # Energy passively recovers each tick (resting metabolism)
         self.homeostasis.update({
             "arousal": float(novelty) * 0.1,
@@ -682,13 +749,24 @@ class ChipBrain:
             if resolution == "crisis":
                 deliberating = True
 
-        # If low confidence, run reasoning chain for refinement
+        # If low confidence, run tree-search planner for best action,
+        # then refine with reasoning chain.
         if deliberating:
             stack_goal = self.goal_stack.current_goal()
             z_goal = stack_goal.target_latent.to(self.device).unsqueeze(0) if (
                 stack_goal and stack_goal.target_latent is not None
             ) else None
             z_wm = self.working_mem.attend(z_conditioned)
+
+            # Tree-search: sample K candidates, roll out through world model,
+            # pick the best trajectory. Overrides the policy's default action.
+            best_action, best_value = self.planner.search(
+                z_current=z_pooled.squeeze(0).detach(),
+                policy_action=raw_action,
+            )
+            raw_action = best_action.to(self.device)
+
+            # Reasoning chain refines the latent for the re-encode pass.
             z_refined, _ = self.reasoning(z_conditioned, z_goal=z_goal, z_wm=z_wm.unsqueeze(0) if z_wm.dim() == 1 else z_wm)
             # Re-encode with refined latent
             raw_action, log_prob, gate = self.policy.get_action(
@@ -759,12 +837,39 @@ class ChipBrain:
         # ----------------------------------------------------------------
         # Periodic background processes
         # ----------------------------------------------------------------
-        # Dream cycle (offline replay)
-        if self._tick % self.cfg["dream_every"] == 0:
-            self.dream.run(self.policy, self.memory, batch_size=16)
+        energy_fraction = float(self.homeostasis.as_vector()[1].item())
 
-        # World model update
-        if self._tick % self.cfg["world_model_update_every"] == 0:
+        # Circadian sleep/wake gating
+        if not self.circadian.is_sleeping:
+            if self.circadian.should_sleep(
+                energy_fraction=energy_fraction,
+                mean_prediction_error=pred_err_scalar,
+            ):
+                self.circadian.enter_sleep()
+                self.hooks.fire("sleep_enter", {"tick": self._tick})
+        else:
+            novelty_spike = float(novelty) > 0.6
+            if self.circadian.should_wake(energy_fraction=energy_fraction, novelty_spike=novelty_spike):
+                self.circadian.wake_up()
+                self.hooks.fire("sleep_exit", {"tick": self._tick})
+
+        # During sleep: run active dreaming + consolidation more aggressively.
+        # During wake: run on the normal fixed schedule.
+        is_sleeping = self.circadian.is_sleeping
+        dream_interval = max(10, self.cfg["dream_every"] // 3) if is_sleeping else self.cfg["dream_every"]
+        consolidation_interval = max(50, self.cfg["consolidation_every"] // 3) if is_sleeping else self.cfg["consolidation_every"]
+
+        # Active dreaming (replaces the no-op DreamCycle)
+        if self._tick % dream_interval == 0:
+            dream_result = self.active_dreamer.run(self.memory, batch_size=4)
+            if dream_result.get("n_stored", 0) > 0:
+                self.bus.publish(NeuralSignal(
+                    "hippocampus", "*", "dream_complete",
+                    dream_result, priority=0.3,
+                ))
+
+        # World model update (skip during sleep to save compute)
+        if not is_sleeping and self._tick % self.cfg["world_model_update_every"] == 0:
             if self._last_z is not None and self._last_action is not None:
                 self.wm_trainer.update(
                     self._last_z.detach(),
@@ -772,12 +877,31 @@ class ChipBrain:
                     z_pooled.detach(),
                 )
 
-        # Memory consolidation
-        if self._tick % self.cfg["consolidation_every"] == 0:
+        # Memory consolidation (MemoryConsolidator now passes action=None correctly)
+        if self._tick % consolidation_interval == 0:
             dream_batch = self.memory.get_dream_batch(16)
             if dream_batch is not None:
                 consolidator = MemoryConsolidator(self.world_model)
                 consolidator.consolidate(dream_batch.to(self.device))
+
+        # Affective forecaster training (learn to predict future valence)
+        if self._tick % self.cfg["affective_train_every"] == 0:
+            dream_batch = self.memory.get_dream_batch(8)
+            if dream_batch is not None and dream_batch.shape[1] > 1:
+                dream_batch_dev = dream_batch.to(self.device)
+                # Use valence of each state as the training target
+                with torch.no_grad():
+                    B_af, T_af, D_af = dream_batch_dev.shape
+                    flat = dream_batch_dev.reshape(B_af * T_af, D_af)
+                    valence_targets = self.emotions.get_valence(flat).reshape(B_af, T_af, 1)
+                self.affect_trainer.update(dream_batch_dev, valence_targets)
+
+        # EWC consolidation: snapshot policy importance periodically
+        if self._tick % self.cfg["ewc_consolidate_every"] == 0 and self._tick > 0:
+            self.ewc.consolidate()
+
+        # LR scheduler step (every training tick)
+        self.lr_scheduler.step()
 
         # Periodic persistence (autosave)
         if self.cryo.maybe_save(
@@ -899,8 +1023,12 @@ class ChipBrain:
             self.smoother.reset()
             self.working_mem.reset()
 
-        # SAC update
+        # SAC update (with EWC penalty added to actor loss via trainer hook)
         if len(self.buffer.tree.data) > self.cfg["batch_size"]:
+            # Inject EWC penalty into the trainer before the update step
+            ewc_penalty = self.ewc.penalty()
+            if ewc_penalty.item() > 0:
+                self.trainer._ewc_penalty = ewc_penalty
             metrics = self.trainer.update_step(self.cfg["batch_size"])
             if metrics:
                 self.health.record_dict(metrics)
@@ -935,6 +1063,11 @@ class ChipBrain:
             "causal_graph": self.causal.status(),
             "health": self.health.summary(),
             "cryostasis": self.cryo.status(),
+            "circadian": self.circadian.status(),
+            "ewc": self.ewc.status(),
+            "active_dreamer": self.active_dreamer.status(),
+            "planner": self.planner.status(),
+            "emo_significance": getattr(self, "_last_emo_significance", 0.0),
         }
 
     # ------------------------------------------------------------------

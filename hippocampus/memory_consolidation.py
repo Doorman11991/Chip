@@ -78,7 +78,7 @@ class MemoryConsolidator(nn.Module):
             inputs_flat = inputs.reshape(B * (T - 1), D)
             targets_flat = targets.reshape(B * (T - 1), D)
 
-            predictions = self.world_model(inputs_flat)
+            predictions = self.world_model(inputs_flat, action=None)
             loss = F.mse_loss(predictions, targets_flat)
 
             loss.backward()
