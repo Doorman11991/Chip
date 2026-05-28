@@ -90,6 +90,9 @@ class EpisodicRecall:
         """
         Retrieve top-K relevant episodes for the query.
 
+        Uses a cached signature stack on the EpisodicMemory side so we
+        don't rebuild and renormalise (N, D) every tick.
+
         Args:
             query: (D,) or (1, D) latent query vector.
 
@@ -101,7 +104,11 @@ class EpisodicRecall:
         if not self.memory._bank:
             return []
 
-        # Move query to CPU for recall computation — episodes are stored as CPU tensors.
+        sigs = self.memory.get_signature_cache(mode=self.mode)
+        if sigs is None:
+            return []
+
+        # Move query to CPU for similarity (signatures are CPU tensors).
         if query.device.type != 'cpu':
             q = query.detach().to(torch.device('cpu'))
         else:
@@ -110,12 +117,8 @@ class EpisodicRecall:
             q = q.squeeze(0)
         q = F.normalize(q.float(), p=2, dim=0)
 
-        # Stack signatures for vectorised cosine similarity.
         # Use numpy on DirectML (torch matmul on CPU tensors can be intercepted
         # by the DirectML dispatcher). On CUDA/MPS/CPU use torch directly.
-        sigs_list = [self._episode_signature(ep) for ep in self.memory._bank]
-        sigs = torch.stack([F.normalize(s.float(), p=2, dim=0) for s in sigs_list])
-
         if query.device.type == "privateuseone":
             import numpy as np
             sims = (sigs.numpy() @ q.numpy()).tolist()

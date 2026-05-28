@@ -94,7 +94,6 @@ from amygdala.affective_forecast import AffectiveForecaster, AffectiveForecaster
 # Hippocampus
 # ---------------------------------------------------------------------------
 from hippocampus.episodic_memory import EpisodicMemory
-from hippocampus.dream_cycle import DreamCycle
 from hippocampus.active_dreaming import ActiveDreamer
 from hippocampus.temporal_abstraction import TemporalAbstractor
 from hippocampus.spatial_map import CognitiveMap
@@ -109,7 +108,6 @@ from hypothalamus.homeostasis import HomeostaticRegulator
 from hypothalamus.curiosity_drive import CuriosityDrive
 from hypothalamus.energy_manager import EnergyManager
 from hypothalamus.drive_arbitrator import Drive, DriveArbitrator
-from hypothalamus.entropy_temperature import EntropyTemperatureRegulator
 
 # ---------------------------------------------------------------------------
 # Cerebrum
@@ -126,7 +124,6 @@ from cerebrum.narrative_self import NarrativeSelf
 from cerebrum.goal_generator import GoalGenerator
 from cerebrum.goal_stack import GoalStack, GoalFrame
 from cerebrum.personality import PersonalityTraits
-from cerebrum.causal_engine import CausalEngine
 from cerebrum.attention_query import AttentionQueryBuilder
 from cerebrum.inner_speech import InnerSpeech
 from cerebrum.self_consistency import ConsistencyChecker
@@ -135,10 +132,8 @@ from cerebrum.planner import TreeSearchPlanner
 # ---------------------------------------------------------------------------
 # Cerebellum
 # ---------------------------------------------------------------------------
-from cerebellum.swarm_coordinator import SwarmCoordinator
 from cerebellum.action_smoother import ActionSmoother
 from cerebellum.skill_library import SkillLibrary
-from cerebellum.emotional_contagion import EmotionalContagion
 
 
 # ---------------------------------------------------------------------------
@@ -150,15 +145,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "d_model": 512,
     "action_dim": 4,
     "num_heads": 8,
-    "max_seq_len": 128,
+    "max_seq_len": 32,           # was 128 — only ever see 1-8 tokens per tick
 
     # Memory
-    "episodic_capacity": 10_000,
+    "episodic_capacity": 2_000,  # was 10_000 — saves ~250MB at endpoint_only
+    "episodic_endpoint_only": True,
     "sequence_length": 16,
     "narrative_window": 8,
 
     # Training
-    "replay_capacity": 100_000,
+    "replay_capacity": 20_000,   # was 100_000 — saves ~330MB RAM
     "lr_actor": 3e-4,
     "lr_critic": 3e-4,
     "lr_alpha": 3e-4,
@@ -307,8 +303,8 @@ class ChipBrain:
             capacity=self.cfg["episodic_capacity"],
             sequence_length=self.cfg["sequence_length"],
             narrative_window=self.cfg["narrative_window"],
+            endpoint_only=self.cfg.get("episodic_endpoint_only", False),
         ).to(self.device)
-        self.dream = DreamCycle(noise_scale=0.05, counterfactual_k=3)
         self.temporal = TemporalAbstractor(latent_dim=D).to(self.device)
         self.cog_map = CognitiveMap(latent_dim=D, max_cells=512).to(self.device)
         self.recall = EpisodicRecall(self.memory, mode="endpoint", top_k=3, min_similarity=0.3)
@@ -319,7 +315,9 @@ class ChipBrain:
         self.curiosity = CuriosityDrive(latent_dim=D).to(self.device)
         self.energy = EnergyManager()
         self.drive_arb = DriveArbitrator()
-        self.entropy_reg = EntropyTemperatureRegulator(action_dim=A).to(self.device)
+        # EntropyTemperatureRegulator was never called; SAC alpha is managed
+        # by ChipTrainer.log_alpha directly. Removed to save ~0 params (it's
+        # mostly the optimizer state) and reduce boot complexity.
 
         # ---- Cerebrum --------------------------------------------------
         self.working_mem = WorkingMemory(latent_dim=D, capacity=7)
@@ -333,7 +331,9 @@ class ChipBrain:
         self.goals = GoalGenerator(latent_dim=D).to(self.device)
         self.goal_stack = GoalStack(max_depth=5, default_max_ticks=100)
         self.personality = PersonalityTraits(latent_dim=D).to(self.device)
-        self.causal = CausalEngine(latent_dim=D, action_dim=A).to(self.device)
+        # CausalEngine was instantiated but only status() was ever called.
+        # Removed to save ~1.6 MB params. Re-add when attribute()/regret()
+        # are wired into train_step.
         self.attn_query = AttentionQueryBuilder(d_model=D).to(self.device)
         self.inner_speech = InnerSpeech(
             period=self.cfg["inner_speech_every"],
@@ -359,10 +359,10 @@ class ChipBrain:
         ).to(self.device)
 
         # ---- Cerebellum ------------------------------------------------
-        self.swarm = SwarmCoordinator(latent_dim=D, n_nodes=3)
+        # SwarmCoordinator and EmotionalContagion were instantiated but never
+        # called from tick(). Removed to save ~3 MB params.
         self.smoother = ActionSmoother(action_dim=A, method="ema", alpha=0.7)
         self.skills = SkillLibrary(latent_dim=D)
-        self.emo_contagion = EmotionalContagion()
 
         # ---- Brainstem trainer -----------------------------------------
         self.buffer = PrioritizedReplayBuffer(capacity=self.cfg["replay_capacity"])
@@ -422,6 +422,12 @@ class ChipBrain:
         # ---- Affective forecaster + trainer ----------------------------
         self.affect_forecaster = AffectiveForecaster(latent_dim=D).to(self.device)
         self.affect_trainer = AffectiveForecasterTrainer(self.affect_forecaster)
+
+        # ---- Memory consolidator ---------------------------------------
+        # Built once so the Adam optimizer state persists across consolidations.
+        # Previously this was rebuilt inside the periodic block every 200 ticks,
+        # which threw away learned momentum each time.
+        self.consolidator = MemoryConsolidator(self.world_model)
 
         self._booted = True
 
@@ -919,13 +925,12 @@ class ChipBrain:
                     z_pooled.detach(),
                 )
 
-        # Memory consolidation (MemoryConsolidator now passes action=None correctly)
+        # Memory consolidation (uses the persistent consolidator built at boot)
         if self._tick % consolidation_interval == 0 and self.energy.can_afford("memory_consolidation"):
             self.energy.spend("memory_consolidation")
             dream_batch = self.memory.get_dream_batch(16)
             if dream_batch is not None:
-                consolidator = MemoryConsolidator(self.world_model)
-                consolidator.consolidate(dream_batch.to(self.device))
+                self.consolidator.consolidate(dream_batch.to(self.device))
 
         # Affective forecaster training (learn to predict future valence)
         if self._tick % self.cfg["affective_train_every"] == 0:
@@ -1103,7 +1108,6 @@ class ChipBrain:
             "inner_speech": self.inner_speech.status(),
             "self_consistency": self.consistency.status(),
             "narrative": self.narrative.status(),
-            "causal_graph": self.causal.status(),
             "health": self.health.summary(),
             "cryostasis": self.cryo.status(),
             "circadian": self.circadian.status(),

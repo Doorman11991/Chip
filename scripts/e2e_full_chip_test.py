@@ -110,6 +110,9 @@ def get_brain():
             "affective_train_every": 3,
             "world_model_update_every": 2,
             "inner_speech_every": 4,
+            # Tests run ticks back-to-back; disable rate limiter so periodic
+            # ops fire and counters advance.
+            "min_tick_interval": 0.0,
         }).boot()
     return _brain
 
@@ -189,7 +192,7 @@ def test_status_completeness():
         "tick", "device", "mood", "homeostasis", "top_goal", "goal_stack",
         "working_memory", "episodic_memory_size", "cognitive_map",
         "meta_cognition", "inner_speech", "self_consistency", "narrative",
-        "causal_graph", "health", "cryostasis",
+        "health", "cryostasis",
         # New modules
         "circadian", "ewc", "active_dreamer", "planner", "emo_significance",
     ]

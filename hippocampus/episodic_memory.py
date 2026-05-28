@@ -51,6 +51,10 @@ class EpisodicMemory(IEpisodicMemory):
         sequence_length:   Canonical episode length (pad/truncate to this).
         narrative_window:  How many recent episodes to feed the narrative GRU.
         half_life_steps:   Recency decay half-life in training steps.
+        endpoint_only:     If True, store only the final state per episode
+                           (D floats instead of T x D). Cuts memory by ~16x.
+                           Significant episodes (boundary-flagged) keep
+                           the full sequence regardless of this flag.
     """
 
     def __init__(
@@ -60,15 +64,26 @@ class EpisodicMemory(IEpisodicMemory):
         sequence_length: int = 16,
         narrative_window: int = 8,
         half_life_steps: int = 5_000,
+        endpoint_only: bool = False,
     ) -> None:
         super().__init__()
         self.capacity = capacity
         self.sequence_length = sequence_length
         self.narrative_window = narrative_window
         self.half_life_steps = float(half_life_steps)
+        self.endpoint_only = endpoint_only
+        self.latent_dim = latent_dim
 
         self._bank: deque = deque(maxlen=capacity)
         self._current_step: int = 0
+
+        # Cached signature stack for fast recall (built on demand, invalidated
+        # on every store_episode). Recall does cosine similarity against
+        # signatures every tick, so caching avoids rebuilding the (N, D)
+        # stack from scratch each time.
+        self._sig_cache: Optional[torch.Tensor] = None     # (N, D) normalised
+        self._sig_cache_mode: Optional[str] = None         # "endpoint" or "trajectory"
+        self._sig_cache_size: int = 0                      # n episodes when cached
 
         self.narrative_encoder = nn.GRU(latent_dim, latent_dim, batch_first=True)
         self.self_token = nn.Parameter(torch.randn(1, 1, latent_dim))
@@ -84,11 +99,51 @@ class EpisodicMemory(IEpisodicMemory):
     def size(self) -> int:
         return len(self._bank)
 
+    def get_signature_cache(self, mode: str = "endpoint") -> Optional[torch.Tensor]:
+        """
+        Return a cached (N, D) stack of L2-normalised episode signatures
+        for cosine similarity. Rebuilt only when the bank changes.
+
+        Args:
+            mode: "endpoint" or "trajectory" (averaging mode).
+
+        Returns:
+            (N, D) CPU tensor, or None if bank is empty.
+        """
+        if not self._bank:
+            return None
+
+        # Cache valid: same mode and same bank size.
+        cache_valid = (
+            self._sig_cache is not None
+            and self._sig_cache_mode == mode
+            and self._sig_cache_size == len(self._bank)
+        )
+        if cache_valid:
+            return self._sig_cache
+
+        # Rebuild
+        import torch.nn.functional as F  # local import to avoid top-level cost
+        sigs = []
+        for ep in self._bank:
+            states = ep["states"]
+            if mode == "endpoint":
+                sig = states[-1]
+            else:  # trajectory
+                sig = states.mean(dim=0)
+            sig = sig.to('cpu') if sig.device.type != 'cpu' else sig
+            sigs.append(F.normalize(sig.float(), p=2, dim=0))
+        self._sig_cache = torch.stack(sigs)
+        self._sig_cache_mode = mode
+        self._sig_cache_size = len(self._bank)
+        return self._sig_cache
+
     def store_episode(
         self,
         state_sequence: torch.Tensor,
         valence_sequence: torch.Tensor,
         empowerment_score: float,
+        force_full_sequence: bool = False,
     ) -> None:
         significance = torch.abs(valence_sequence.mean()) + empowerment_score
         states = state_sequence.detach().to('cpu')
@@ -101,6 +156,14 @@ class EpisodicMemory(IEpisodicMemory):
             states = torch.cat([states, pad], dim=0)
         elif T > target_T:
             states = states[-target_T:]
+
+        # Endpoint-only storage: keep only the last state to save memory.
+        # Significant episodes (force_full_sequence=True, e.g. boundary-flagged
+        # or high-significance ones) keep the full sequence so dream batches
+        # and consolidation still have temporal data to work with.
+        if self.endpoint_only and not force_full_sequence and float(significance.item()) < 0.5:
+            states = states[-1:]  # (1, D)
+
         self._bank.append(
             {
                 "states": states,
@@ -108,6 +171,8 @@ class EpisodicMemory(IEpisodicMemory):
                 "step": self._current_step,
             }
         )
+        # Invalidate signature cache — bank changed
+        self._sig_cache = None
 
     # ------------------------------------------------------------------
     # Convenience: encode raw text into memory via the granite embedder
@@ -186,10 +251,18 @@ class EpisodicMemory(IEpisodicMemory):
             return None
 
         weights = self._effective_weights()
-        target_size = min(
-            self._bank[-1]["states"].shape[0] if self._bank else 0,
-            int(self.sequence_length),
+        target_T = int(self.sequence_length)
+
+        # Build a mask of episodes that have full-length sequences (skip
+        # endpoint-only stored episodes — they can't be dreamed about).
+        full_mask = torch.tensor(
+            [float(ep["states"].shape[0] == target_T) for ep in self._bank],
+            dtype=torch.float32,
         )
+        weights = weights * full_mask
+        if weights.sum() <= 0:
+            return None
+
         sampled: list = []
         attempts = 0
         max_attempts = max(batch_size * 4, batch_size + 16)
@@ -197,7 +270,7 @@ class EpisodicMemory(IEpisodicMemory):
             idx = torch.multinomial(weights, 1, replacement=True).item()
             ep = self._bank[idx]
             states = ep["states"]
-            if states.dim() == 2 and states.shape[0] == target_size:
+            if states.dim() == 2 and states.shape[0] == target_T:
                 sampled.append(states)
             attempts += 1
         if len(sampled) < batch_size:

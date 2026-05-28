@@ -160,7 +160,7 @@ class NarrativeSelf(nn.Module):
 
         # nn.GRU is not supported on DirectML (privateuseone) — run on CPU.
         # On CUDA/MPS/CPU the GRU runs natively on the device.
-        if device.type == "privateuseone":
+        if dev.type == "privateuseone":
             narrative_cpu = torch.stack(self._narrative_buffer).to('cpu').unsqueeze(0)
             gru_cpu = self.narrative_gru.cpu()
             with torch.no_grad():
